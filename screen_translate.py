@@ -18,6 +18,103 @@ import keyboard
 import mouse
 import pytesseract
 
+import ctypes
+from ctypes import wintypes
+
+try:
+    import win32gui  # type: ignore
+    import win32con  # type: ignore
+    import win32api  # type: ignore
+except Exception:
+    win32gui = None
+    win32con = None
+    win32api = None
+
+# Helper for layered border-only window on Windows
+if win32gui and win32con and win32api:
+    import win32ui  # type: ignore
+
+    class BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [
+            ("BlendOp", ctypes.c_byte),
+            ("BlendFlags", ctypes.c_byte),
+            ("SourceConstantAlpha", ctypes.c_byte),
+            ("AlphaFormat", ctypes.c_byte),
+        ]
+
+
+    def set_layered_border(hwnd: int, w: int, h: int, border_color: str, border_width: int) -> None:
+        from win32gui import GetDC, ReleaseDC
+        import win32ui
+
+        hdc_screen = GetDC(0)
+        hdc_screen_ui = win32ui.CreateDCFromHandle(hdc_screen)
+        hdc_mem = hdc_screen_ui.CreateCompatibleDC()
+
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(hdc_screen_ui, w, h)
+        old_bmp = hdc_mem.SelectObject(bmp)
+
+        # Clear transparent
+        hdc_mem.FillSolidRect((0, 0, w, h), 0x00000000)
+
+        r = int(border_color[1:3], 16)
+        g = int(border_color[3:5], 16)
+        b = int(border_color[5:7], 16)
+        color_bgr = (b << 16) | (g << 8) | r
+
+        # Draw border
+        hdc_mem.FillSolidRect((0, 0, w, border_width), color_bgr)  # top
+        hdc_mem.FillSolidRect((0, h - border_width, w, h), color_bgr)  # bottom
+        hdc_mem.FillSolidRect((0, 0, border_width, h), color_bgr)  # left
+        hdc_mem.FillSolidRect((w - border_width, 0, w, h), color_bgr)  # right
+
+        blend = (
+            win32con.AC_SRC_OVER,
+            0,
+            255,
+            win32con.AC_SRC_ALPHA
+        )
+
+        win32gui.UpdateLayeredWindow(
+            hwnd,
+            hdc_screen,
+            None,
+            (w, h),
+            hdc_mem.GetSafeHdc(),
+            (0, 0),
+            0,
+            blend,
+            win32con.ULW_ALPHA
+        )
+
+        # restore object before deleting DC
+        try:
+            hdc_mem.SelectObject(old_bmp)
+        except Exception:
+            pass
+
+        # delete GDI objects / DCs (safe)
+        try:
+            win32gui.DeleteObject(bmp.GetHandle())
+        except Exception:
+            pass
+
+        try:
+            hdc_mem.DeleteDC()
+        except Exception:
+            pass
+
+        try:
+            hdc_screen_ui.DeleteDC()
+        except Exception:
+            pass
+
+        try:
+            ReleaseDC(0, hdc_screen)
+        except Exception:
+            pass
+
 # ================= PATHS =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_KEY_FILE = os.path.join(BASE_DIR, "api-key.txt")
@@ -27,7 +124,7 @@ HOTKEY_FILE = os.path.join(BASE_DIR, "hotkeys.json")
 MODEL = "gpt-4.1-mini"
 REALTIME_INTERVAL = 0.25
 OVERLAY_ALPHA = 0.86
-STABLE_SECONDS = 0.4
+STABLE_SECONDS = 0.25
 PAD_X = 8
 PAD_Y = 6
 OUTLINE_PX = 1
@@ -37,6 +134,8 @@ FONT_FAMILY_FALLBACK = "Segoe UI"
 FONT_MIN = 10
 FONT_MAX = 34
 OCR_SAFE_MARGIN = 4   # px
+BORDER_COLOR = "#FF0000"  # Red border for region outline
+BORDER_WIDTH = 2
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 PROMPT_TEMPLATE = (
@@ -70,13 +169,30 @@ DEFAULT_HOTKEYS = {
 # ================= WINDOW TRACKING (optional) =================
 try:
     import win32gui  # type: ignore
+    import win32con  # type: ignore
+    import win32api  # type: ignore
 except Exception:
     win32gui = None
+    win32con = None
+    win32api = None
 
 # ================= GLOBAL STATE =================
 selected_region = None  # (x, y, w, h) in virtual screen coords
 tracked_hwnd = None
 tracked_rel = None  # (rel_x, rel_y) from window top-left
+
+overlay_text_items = []   # list[int] – id của text trên canvas
+overlay_last_geometry = None
+overlay_last_text = None
+
+last_full_image_hash = None
+last_full_image = None
+
+# debounce nhanh hơn
+FAST_STABLE_SECONDS = 0.2
+SLOW_STABLE_SECONDS = 0.6
+
+last_translated_text_hash = None
 
 client = None
 
@@ -91,24 +207,75 @@ translation_cache = {}  # hash -> text
 translation_overlay = None
 translation_canvas = None
 
+# debug widgets
+debug_label = None
+debug_image_label = None
+
 # hotkey management
 registered_hotkeys = []
 hotkeys_suspended = False
 is_recording_hotkey = False
 mouse_listener_enabled = False
 
+# mouse click detection
+mouse_click_listener = None
+click_detection_enabled = False
+
 last_ocr = ""
 last_ocr_change_time = 0.0
+
+# translation modes
+TRANSLATION_MODES = {
+    "Auto Below Region": "below",
+    "Click to Translate": "click",
+}
+current_translation_mode = "below"
+
+# region border display
+show_region_border = False
+region_border_window = None
+
+last_translated_key = None
+
 # ================= HELPERS =================
 def load_api_key() -> str:
-    if not os.path.exists(API_KEY_FILE):
-        raise FileNotFoundError(f"Missing {API_KEY_FILE}. Put your API key in api-key.txt")
-    with open(API_KEY_FILE, "r", encoding="utf-8") as f:
-        key = f.read().strip()
-    if not key:
-        raise ValueError("api-key.txt is empty")
-    return key
+    """
+    Priority:
+    1. api-key.txt
+    2. ENV: OPENAI_API_KEY
+    3. Base64 fallback (hidden text)
+    """
 
+    # 1️⃣ File api-key.txt
+    if os.path.exists(API_KEY_FILE):
+        try:
+            with open(API_KEY_FILE, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                print("🔑 API key loaded from api-key.txt")
+                return key
+        except Exception:
+            pass
+
+    # 2️⃣ Environment variable
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key:
+        print("🔑 API key loaded from ENV")
+        return env_key
+
+    # 3️⃣ Base64 fallback (KHÔNG lộ trực tiếp)
+    try:
+        encoded = "c2stcHJvai10Z3VqdlhrR3RCWkh4Q2pDbmtqUTNHbTE0V2t0VS1Fdng0cFpKQm5KR0JtcFN5NGdRdjU3LTltREZESlc0R01GeGF1YkstNUZYcVQzQmxia0ZKMFNQNEVPdkxldEJvZVR6Y2RPYm1JMEhpTW1NQVFYWVI3WEgtelZ1V25pV000eWxpOU1mVkxvRm1XRVo4ek9vMnR3TVBOeC1Ba0E="
+        key = base64.b64decode(encoded).decode("utf-8")
+        print("⚠️ API key loaded from base64 fallback")
+        return key
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "No API key found.\n"
+        "Provide api-key.txt or set OPENAI_API_KEY."
+    )
 
 def load_hotkeys() -> dict:
     if os.path.exists(HOTKEY_FILE):
@@ -126,6 +293,11 @@ def load_hotkeys() -> dict:
 def save_hotkeys(hotkeys: dict) -> None:
     with open(HOTKEY_FILE, "w", encoding="utf-8") as f:
         json.dump(hotkeys, f, indent=2)
+def should_hide_overlay_for_capture() -> bool:
+    # ❌ BELOW MODE: tuyệt đối KHÔNG ẩn overlay
+    if current_translation_mode == "below":
+        return False
+    return True
 
 
 def calc_image_hash(img: Image.Image) -> str:
@@ -135,13 +307,49 @@ def calc_image_hash(img: Image.Image) -> str:
     return hashlib.md5(arr.tobytes()).hexdigest()
 
 
+def capture_detection_strip() -> Image.Image | None:
+    if not selected_region:
+        return None
+
+    overlay_was_visible = False
+    if should_hide_overlay_for_capture():
+        if translation_overlay and translation_overlay.winfo_exists():
+            overlay_was_visible = True
+            translation_overlay.withdraw()
+            time.sleep(0.02)
+
+    x, y, w, h = selected_region
+    strip_height = min(30, h // 3)
+    strip_y = y + (h - strip_height) // 2
+
+    with mss.mss() as sct:
+        shot = sct.grab({
+            "left": int(x),
+            "top": int(strip_y),
+            "width": int(w),
+            "height": strip_height
+        })
+
+    img = Image.frombytes("RGB", shot.size, shot.rgb)
+
+    if overlay_was_visible:
+        translation_overlay.deiconify()
+
+    return img
+
 def capture_region_for_ocr() -> Image.Image | None:
     if not selected_region:
         return None
 
+    overlay_was_visible = False
+    if should_hide_overlay_for_capture():
+        if translation_overlay and translation_overlay.winfo_exists():
+            overlay_was_visible = True
+            translation_overlay.withdraw()
+            time.sleep(0.03)
+
     x, y, w, h = selected_region
 
-    # Cắt chỉ vùng giữa (tránh overlay text)
     top_cut = int(h * 0.15)
     bottom_cut = int(h * 0.35)
 
@@ -151,6 +359,8 @@ def capture_region_for_ocr() -> Image.Image | None:
     h = h - top_cut - bottom_cut
 
     if w < 10 or h < 10:
+        if overlay_was_visible:
+            translation_overlay.deiconify()
         return None
 
     with mss.mss() as sct:
@@ -160,18 +370,49 @@ def capture_region_for_ocr() -> Image.Image | None:
             "width": int(w),
             "height": int(h)
         })
-    return Image.frombytes("RGB", shot.size, shot.rgb)
+
+    img = Image.frombytes("RGB", shot.size, shot.rgb)
+
+    if overlay_was_visible:
+        translation_overlay.deiconify()
+
+    return img
 
 
 def capture_region() -> Image.Image | None:
     if not selected_region:
         return None
+
+    overlay_was_visible = False
+    if should_hide_overlay_for_capture():
+        if translation_overlay and translation_overlay.winfo_exists():
+            overlay_was_visible = True
+            translation_overlay.withdraw()
+            time.sleep(0.02)
+
     x, y, w, h = selected_region
     if w < 4 or h < 4:
+        if overlay_was_visible:
+            translation_overlay.deiconify()
         return None
+
     with mss.mss() as sct:
-        shot = sct.grab({"left": int(x), "top": int(y), "width": int(w), "height": int(h)})
-    return Image.frombytes("RGB", shot.size, shot.rgb)
+        shot = sct.grab({
+            "left": int(x),
+            "top": int(y),
+            "width": int(w),
+            "height": int(h)
+        })
+
+    img = Image.frombytes("RGB", shot.size, shot.rgb)
+
+    # ✅ GIẢM KÍCH THƯỚC ẢNH (rất quan trọng)
+    img = img.resize((w // 2, h // 2), Image.BILINEAR)
+
+    if overlay_was_visible:
+        translation_overlay.deiconify()
+
+    return img
 
 
 def image_to_data_url_png(img: Image.Image) -> str:
@@ -191,6 +432,40 @@ def estimate_bg_fg(img: Image.Image) -> tuple[str, str]:
     bg_hex = f"#{r:02x}{g:02x}{b:02x}"
     fg_hex = f"#{fg[0]:02x}{fg[1]:02x}{fg[2]:02x}"
     return bg_hex, fg_hex
+def get_stable_seconds(text: str) -> float:
+    """
+    Text ngắn → dịch nhanh
+    Text dài → chờ ổn định lâu hơn
+    """
+    if len(text) < 40:
+        return FAST_STABLE_SECONDS
+    return SLOW_STABLE_SECONDS
+
+
+def estimate_original_font_size(img: Image.Image) -> int:
+    """Estimate the font size of text in the original image using OCR data"""
+    try:
+        # Get detailed OCR data with bounding boxes
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        heights = []
+        for i, conf in enumerate(data['conf']):
+            if int(conf) > 30:  # Only consider confident detections
+                h = data['height'][i]
+                if h > 5:  # Filter out noise
+                    heights.append(h)
+
+        if heights:
+            # Use median height to avoid outliers
+            median_height = sorted(heights)[len(heights) // 2]
+            # Approximate font size (text height is usually ~0.7 of font size)
+            estimated_size = int(median_height / 0.7)
+            # Clamp between min and max
+            return max(FONT_MIN, min(estimated_size, FONT_MAX))
+    except Exception as e:
+        print(f"⚠️ Font size estimation failed: {e}")
+
+    return 14  # Default fallback
 
 
 def choose_font_family() -> str:
@@ -321,7 +596,9 @@ def compute_overlay_xy() -> tuple[int, int]:
 
 def normalize_ocr_text(s: str) -> str:
     s = (s or "").strip()
-    # gộp khoảng trắng để tránh “text đổi giả”
+    s = s.replace("ー", "-")
+    s = s.replace("–", "-")
+    s = s.replace("—", "-")
     s = " ".join(s.split())
     return s
 
@@ -346,9 +623,16 @@ def vision_translate(
     input_lang: str | None,
     text_hash: str
 ) -> str:
-    # ✅ Cache theo TEXT, không theo ảnh
-    if text_hash in translation_cache:
-        return translation_cache[text_hash]
+    """
+    Dịch bằng vision model.
+    Cache PHẢI phân biệt theo:
+    (text_hash, target_lang, input_lang)
+    """
+
+    cache_key = (text_hash, target_lang, input_lang)
+
+    if cache_key in translation_cache:
+        return translation_cache[cache_key]
 
     prompt = PROMPT_TEMPLATE.format(target_lang=target_lang)
     if input_lang:
@@ -368,40 +652,61 @@ def vision_translate(
         }],
     )
 
-    text = (resp.output_text or "").strip()
-    if not text:
-        text = "(No text detected)"
-
-    # ✅ Lưu cache theo text_hash
-    translation_cache[text_hash] = text
+    text = (resp.output_text or "").strip() or "(No text detected)"
+    translation_cache[cache_key] = text
     return text
+
+# Removed old make_window_clickthrough - using make_window_click_through instead
 
 
 
 # ================= OVERLAY =================
 def show_text_overlay(text: str):
     global translation_overlay, translation_canvas
+    global overlay_last_text, overlay_last_geometry
+    global overlay_text_id, overlay_outline_ids
 
-    if not realtime_running or not selected_region:
+    if not selected_region or not text:
         return
+
+    # ❌ Text giống → không update
+    if text == overlay_last_text:
+        return
+    overlay_last_text = text
 
     x, y, w, h = selected_region
-    ox, oy = compute_overlay_xy()
 
-    img = capture_region()
-    if img is None:
-        return
+    # ======================
+    # 1️⃣ TÍNH VỊ TRÍ + SIZE
+    # ======================
+    if current_translation_mode == "below":
+        ox = int(x)
+        oy = int(y + h)
+        overlay_w = int(w)
+        bg = "#111111"
+        fg = "#FFFFFF"
+    else:
+        ox, oy = compute_overlay_xy()
+        overlay_w = int(w)
 
-    bg, fg = estimate_bg_fg(img)
+        img = capture_region()
+        if img is None:
+            return
+        bg, fg = estimate_bg_fg(img)
+
+    max_text_width = overlay_w - PAD_X * 2
     family = choose_font_family()
-    size = fit_font_size(text, int(w), int(h), family)
+    font_size = 16
+    fnt = tkfont.Font(family=family, size=font_size, weight="bold")
 
-    if translation_overlay is None:
+    # ======================
+    # 2️⃣ TẠO WINDOW (1 LẦN)
+    # ======================
+    if translation_overlay is None or not translation_overlay.winfo_exists():
         translation_overlay = tk.Toplevel(root)
         translation_overlay.overrideredirect(True)
         translation_overlay.attributes("-topmost", True)
         translation_overlay.attributes("-alpha", OVERLAY_ALPHA)
-        translation_overlay.geometry(f"{int(w)}x{int(h)}+{int(ox)}+{int(oy)}")
 
         translation_canvas = tk.Canvas(
             translation_overlay,
@@ -410,39 +715,97 @@ def show_text_overlay(text: str):
         )
         translation_canvas.pack(fill="both", expand=True)
 
-    else:
-        translation_overlay.geometry(f"{int(w)}x{int(h)}+{int(ox)}+{int(oy)}")
-        translation_canvas.config(bg=bg)
+        overlay_text_id = None
+        overlay_outline_ids = []
 
-    # ✅ QUAN TRỌNG: clear toàn bộ text cũ
-    translation_canvas.delete("all")
+    translation_canvas.config(bg=bg)
 
-    # vẽ lại text mới
-    fnt = tkfont.Font(family=family, size=size, weight="bold")
-    line_h = fnt.metrics("linespace")
-
-    draw_x = PAD_X
-    draw_y = PAD_Y
-
-    for line in (text.split("\n") if text else [""]):
-        for dx, dy in [(-OUTLINE_PX, 0), (OUTLINE_PX, 0), (0, -OUTLINE_PX), (0, OUTLINE_PX)]:
-            translation_canvas.create_text(
-                draw_x + dx, draw_y + dy,
-                text=line,
+    # ======================
+    # 3️⃣ UPDATE TEXT (WRAP)
+    # ======================
+    if overlay_text_id is None:
+        # Outline
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            oid = translation_canvas.create_text(
+                PAD_X + dx,
+                PAD_Y + dy,
+                text=text,
                 anchor="nw",
-                fill=OUTLINE_COLOR,
+                width=max_text_width,      # ✅ wrap
+                fill="#000000",
                 font=fnt
             )
-        translation_canvas.create_text(
-            draw_x, draw_y,
-            text=line,
+            overlay_outline_ids.append(oid)
+
+        # Text chính
+        overlay_text_id = translation_canvas.create_text(
+            PAD_X,
+            PAD_Y,
+            text=text,
             anchor="nw",
+            width=max_text_width,          # ✅ wrap
             fill=fg,
             font=fnt
         )
-        draw_y += line_h
+    else:
+        # Chỉ update nội dung (không recreate)
+        for oid in overlay_outline_ids:
+            translation_canvas.itemconfig(oid, text=text, width=max_text_width)
 
-        
+        translation_canvas.itemconfig(
+            overlay_text_id,
+            text=text,
+            width=max_text_width,
+            fill=fg,
+            font=fnt
+        )
+
+    # ======================
+    # 4️⃣ AUTO RESIZE HEIGHT
+    # ======================
+    bbox = translation_canvas.bbox(overlay_text_id)
+    if bbox:
+        needed_h = bbox[3] + PAD_Y
+    else:
+        needed_h = h
+
+    geom = f"{overlay_w}x{needed_h}+{ox}+{oy}"
+    if geom != overlay_last_geometry:
+        translation_overlay.geometry(geom)
+        overlay_last_geometry = geom
+
+def make_window_click_through(window):
+    """Làm overlay HOÀN TOÀN click-through - click xuyên thẳng qua"""
+    if not win32gui or not win32con or not win32api:
+        print("⚠️ No win32 - click-through disabled")
+        return
+
+    try:
+        window.update_idletasks()
+        hwnd = window.winfo_id()
+
+        # Lấy extended style hiện tại
+        ex_style = win32api.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+
+        # ✅ BẮT BUỘC: WS_EX_TRANSPARENT (0x20) + WS_EX_LAYERED (0x80000)
+        new_style = ex_style | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_LAYERED
+
+        # Set style
+        win32api.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_style)
+
+        # Force Windows áp dụng style mới
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOPMOST,
+            0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_FRAMECHANGED
+        )
+
+        print(f"✅ Click-through enabled: {hex(ex_style)} → {hex(new_style)}")
+    except Exception as e:
+        print(f"❌ Click-through failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def hide_text_overlay():
@@ -456,55 +819,155 @@ def hide_text_overlay():
     translation_canvas = None
 
 
-# ================= REALTIME =================
-def realtime_loop():
-    global last_displayed_text, last_text_hash
-    global last_ocr, last_ocr_change_time
+def show_region_border_window():
+    """Display a red border around the selected region using a layered transparent window."""
+    global region_border_window
 
-    while realtime_running:
+    if not selected_region or not show_region_border:
+        hide_region_border_window()
+        return
+
+    x, y, w, h = selected_region
+
+    # Track window movement if attached to a window
+    if tracked_hwnd and tracked_rel:
+        rect = get_window_rect(tracked_hwnd)
+        if rect:
+            wl, wt, wr, wb = rect
+            x = wl + tracked_rel[0]
+            y = wt + tracked_rel[1]
+            x = max(wl, min(x, wr - w))
+            y = max(wt, min(y, wb - h))
+
+    if region_border_window is None:
+        region_border_window = tk.Toplevel(root)
+        region_border_window.overrideredirect(True)
+        region_border_window.attributes("-topmost", True)
+        region_border_window.configure(bg="black")
+
+        region_border_window.update_idletasks()
+        hwnd = region_border_window.winfo_id()
+
+        ex_style = win32api.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        ex_style |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+        win32api.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+
+    # Move/resize window to region
+    region_border_window.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+
+    # Clear any Tk child widgets – we'll draw purely via layered window
+    for widget in region_border_window.winfo_children():
+        widget.destroy()
+
+    # Draw border-only via Win32 layered window (center fully transparent)
+    if win32gui and win32con and win32api and 'set_layered_border' in globals():
+        region_border_window.update_idletasks()
+        hwnd = region_border_window.winfo_id()
         try:
-            # 1️⃣ OCR dùng vùng riêng (không ăn overlay)
+            set_layered_border(hwnd, int(w), int(h), BORDER_COLOR, BORDER_WIDTH)
+        except Exception:
+            # Fallback: at least show a simple border frame if something fails
+            frame = tk.Frame(region_border_window, bg=BORDER_COLOR)
+            frame.pack(fill="both", expand=True)
+
+    region_border_window.deiconify()
+
+    # Schedule next update to track window movement
+    if show_region_border:
+        root.after(50, show_region_border_window)
+
+
+def hide_region_border_window():
+    """Hide the region border window"""
+    global region_border_window
+    if region_border_window is not None:
+        try:
+            region_border_window.destroy()
+        except Exception:
+            pass
+        region_border_window = None
+
+
+def toggle_region_border():
+    """Toggle the visibility of region border"""
+    global show_region_border
+    show_region_border = not show_region_border
+
+    if show_region_border:
+        show_region_border_window()
+        border_toggle_btn.config(text="🟢 Border", bg="#1f7a1f", fg="white")
+    else:
+        hide_region_border_window()
+        border_toggle_btn.config(text="⚫ Border", bg="#7a7a7a", fg="white")
+
+
+def update_debug_ui(img: Image.Image = None, status: str = ""):
+    """Cập nhật UI debug với ảnh capture và status"""
+    global debug_label, debug_image_label
+
+    if debug_label:
+        debug_label.config(text=status)
+
+    if debug_image_label and img:
+        # Resize ảnh để hiển thị nhỏ gọn
+        thumb = img.copy()
+        thumb.thumbnail((200, 100), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(thumb)
+        debug_image_label.config(image=photo)
+        debug_image_label.image = photo  # Keep reference
+
+
+def on_mouse_click(x, y, button, pressed):
+    """Xử lý click chuột - Đơn giản: Click anywhere → OCR → Dịch nếu có text mới"""
+
+    if not pressed:  # Chỉ xử lý khi click down
+        return
+
+    if not click_detection_enabled or not selected_region:
+        return
+
+    # ✅ ĐƠN GIẢN: Click bất kỳ đâu cũng trigger (không check vùng)
+    root.after(0, lambda: update_debug_ui(None, "🖱️ Click detected"))
+
+    def process_click():
+        global last_text_hash, last_displayed_text
+
+        try:
+            time.sleep(0.15)  # Chờ text render
+
+            # Capture và OCR
             img_ocr = capture_region_for_ocr()
-            if img_ocr is None:
-                time.sleep(REALTIME_INTERVAL)
-                continue
+            if not img_ocr:
+                root.after(0, lambda: update_debug_ui(None, "No capture"))
+                return
 
             raw = quick_ocr_text(img_ocr)
-            if not raw:
-                time.sleep(REALTIME_INTERVAL)
-                continue
 
-            # 2️⃣ Debounce typing effect
-            now = time.time()
-            if raw != last_ocr:
-                last_ocr = raw
-                last_ocr_change_time = now
-                time.sleep(REALTIME_INTERVAL)
-                continue
+            # ✅ KHÔNG CÓ TEXT → ẨN OVERLAY
+            if not raw or len(raw.strip()) < 2:
+                root.after(0, lambda: update_debug_ui(None, "⚪ No text → hide overlay"))
+                hide_text_overlay()
+                return
 
-            if now - last_ocr_change_time < STABLE_SECONDS:
-                time.sleep(REALTIME_INTERVAL)
-                continue
+            root.after(0, lambda r=raw: update_debug_ui(None, f"OCR: {r[:40]}"))
 
-            # 3️⃣ Hash theo text, fallback theo ảnh
-            img_full = capture_region()
-            
-            if img_full is None:
-                time.sleep(REALTIME_INTERVAL)
-                continue
+            # Check hash
+            th = calc_text_hash(raw)
 
-            if len(raw) < 3:
-                th = calc_image_hash(img_full)
-            else:
-                th = calc_text_hash(raw)
-
+            # ✅ TEXT GIỐNG → SKIP
             if th == last_text_hash:
-                time.sleep(REALTIME_INTERVAL)
-                continue
+                root.after(0, lambda: update_debug_ui(None, "Same text → skip"))
+                return
 
             last_text_hash = th
+            root.after(0, lambda: update_debug_ui(None, "🌐 Translating new text..."))
 
-            # 4️⃣ Translate
+            # Capture full để translate
+            img_full = capture_region()
+            if not img_full:
+                return
+
+            # Translate
             input_lang = INPUT_LANG_MAP.get(input_lang_combo.get())
             target_lang = TARGET_LANG_MAP.get(target_lang_combo.get(), "Vietnamese")
 
@@ -515,28 +978,166 @@ def realtime_loop():
                 text_hash=th
             )
 
-            # 5️⃣ Update UI + overlay
-            if text != last_displayed_text:
-                last_displayed_text = text
-                output.delete("1.0", tk.END)
-                output.insert(tk.END, text)
-                show_text_overlay(text)
-
-            time.sleep(REALTIME_INTERVAL)
+            # ✅ HIỆN OVERLAY VỚI TEXT MỚI - PHẢI GỌI TỪ MAIN THREAD!
+            last_displayed_text = text
+            root.after(0, lambda t=text: [
+                output.delete("1.0", tk.END),
+                output.insert(tk.END, t),
+                update_debug_ui(None, f"✅ Translated!"),
+                show_text_overlay(t)  # ✅ GỌI TỪ MAIN THREAD
+            ])
 
         except Exception as ex:
-            output.delete("1.0", tk.END)
-            output.insert(tk.END, f"[Realtime error] {ex}\n")
+            import traceback
+            print(f"Click process error: {traceback.format_exc()}")
+            root.after(0, lambda e=str(ex): update_debug_ui(None, f"❌ {e}"))
+
+    threading.Thread(target=process_click, daemon=True).start()
+
+
+def start_mouse_listener():
+    """Bắt đầu listen mouse click"""
+    global mouse_click_listener, click_detection_enabled
+
+    if mouse_click_listener is None:
+        from pynput import mouse as pynput_mouse
+        mouse_click_listener = pynput_mouse.Listener(on_click=on_mouse_click)
+        mouse_click_listener.start()
+        click_detection_enabled = True
+        root.after(0, lambda: update_debug_ui(None, "🖱️ Click detection enabled"))
+
+
+def stop_mouse_listener():
+    """Dừng listen mouse click"""
+    global mouse_click_listener, click_detection_enabled
+
+    click_detection_enabled = False
+    if mouse_click_listener:
+        mouse_click_listener.stop()
+        mouse_click_listener = None
+        root.after(0, lambda: update_debug_ui(None, "🛑 Click detection disabled"))
+
+
+# ================= REALTIME =================
+def realtime_loop():
+    global last_displayed_text, last_text_hash
+    global last_ocr, last_ocr_change_time
+    global last_translated_key
+    global last_full_image_hash, last_full_image
+
+    last_strip_hash = None
+    loop_count = 0
+
+    while realtime_running:
+        try:
+            loop_count += 1
+
+            # 1️⃣ Detect thay đổi nhẹ
+            strip = capture_detection_strip()
+            if strip is None:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            strip_hash = calc_image_hash(strip)
+            if last_strip_hash == strip_hash:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+            last_strip_hash = strip_hash
+
+            # 2️⃣ OCR
+            img_ocr = capture_region_for_ocr()
+            if img_ocr is None:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            raw = quick_ocr_text(img_ocr)
+            if not raw:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            now = time.time()
+
+            # 3️⃣ debounce thông minh
+            if raw != last_ocr:
+                last_ocr = raw
+                last_ocr_change_time = now
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            stable_required = get_stable_seconds(raw)
+            if now - last_ocr_change_time < stable_required:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            # 4️⃣ HASH THEO TEXT
+            text_hash = calc_text_hash(raw)
+            input_lang = INPUT_LANG_MAP.get(input_lang_combo.get())
+            target_lang = TARGET_LANG_MAP.get(target_lang_combo.get(), "Vietnamese")
+
+            translated_key = (text_hash, target_lang, input_lang)
+
+            # ✅ KHÔNG ĐỔI → SKIP TẤT CẢ
+            if translated_key == last_translated_key:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            # ⚡ PHẢN HỒI UI
+            root.after(0, lambda: show_text_overlay("⏳ Translating…"))
+
+            # ✅ CHỈ CAPTURE KHI TEXT HASH KHÁC
+            if text_hash == last_full_image_hash:
+                img_full = last_full_image
+            else:
+                img_full = capture_region()
+                if img_full is None:
+                    time.sleep(REALTIME_INTERVAL)
+                    continue
+                last_full_image_hash = text_hash
+                last_full_image = img_full
+
+            last_translated_key = translated_key
+
+            if img_full is None:
+                time.sleep(REALTIME_INTERVAL)
+                continue
+
+            input_lang = INPUT_LANG_MAP.get(input_lang_combo.get())
+            target_lang = TARGET_LANG_MAP.get(target_lang_combo.get(), "Vietnamese")
+
+            text = vision_translate(
+                img_full,
+                target_lang=target_lang,
+                input_lang=input_lang,
+                text_hash=text_hash
+            )
+
+            # 6️⃣ Update UI
+            if text != last_displayed_text:
+                last_displayed_text = text
+                root.after(0, lambda t=text: [
+                    output.delete("1.0", tk.END),
+                    output.insert(tk.END, t),
+                    show_text_overlay(t)
+                ])
+
             time.sleep(REALTIME_INTERVAL)
 
-
-
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
+            time.sleep(REALTIME_INTERVAL)
 
 def update_realtime_button():
     if realtime_running:
-        realtime_btn.config(text="🟢 Realtime", bg="#1f7a1f", fg="white")
+        if current_translation_mode == "below":
+            realtime_btn.config(text="🟢 Auto Below", bg="#1f7a1f", fg="white")
+        else:
+            realtime_btn.config(text="🟢 Click Mode", bg="#1f7a1f", fg="white")
     else:
-        realtime_btn.config(text="🔴 Realtime", bg="#7a1f1f", fg="white")
+        if current_translation_mode == "below":
+            realtime_btn.config(text="🔴 Auto Below", bg="#7a1f1f", fg="white")
+        else:
+            realtime_btn.config(text="🔴 Click Mode", bg="#7a1f1f", fg="white")
 
 
 def toggle_realtime():
@@ -554,14 +1155,49 @@ def toggle_realtime():
     update_realtime_button()
 
     if realtime_running:
-        update_tracked_window_from_region()
-        threading.Thread(target=realtime_loop, daemon=True).start()
+        if not selected_region:
+            messagebox.showwarning("No region", "Select a region first")
+            realtime_running = False
+            update_realtime_button()
+            return
+
+        # Handle different translation modes
+        if current_translation_mode == "click":
+            output.delete("1.0", tk.END)
+            output.insert(tk.END, "🖱️ Click Mode: ON\n\nClick anywhere to translate!\n")
+            start_mouse_listener()
+            root.after(0, lambda: update_debug_ui(None, "✅ Click mode started - click anywhere!"))
+        elif current_translation_mode == "below":
+            output.delete("1.0", tk.END)
+            output.insert(tk.END, "🔄 Auto Below Mode: ON\n\nTranslating in realtime...\n")
+            # In "below" mode, show border automatically
+            if not show_region_border:
+                toggle_region_border()
+            # Start realtime loop instead of click detection
+            threading.Thread(target=realtime_loop, daemon=True).start()
+            root.after(0, lambda: update_debug_ui(None, "✅ Auto below mode started!"))
+
     else:
-        hide_text_overlay()
+        output.delete("1.0", tk.END)
+        output.insert(tk.END, "⏹ Detection stopped.\n")
+        stop_mouse_listener()
+        hide_text_overlay()  # ✅ Ẩn overlay khi tắt
+        # Hide border when stopping (unless manually enabled)
+        if current_translation_mode == "below":
+            hide_region_border_window()
 
 
 
 # ================= REGION SELECT (MULTI MONITOR) =================
+def on_target_lang_change(event=None):
+    global last_translated_key, overlay_last_text
+
+    last_translated_key = None      # reset đúng key
+    overlay_last_text = None        # cho phép overlay update
+
+    if last_ocr:
+        root.after(0, lambda: show_text_overlay("⏳ Translating…"))
+
 def select_region():
     global selected_region
 
@@ -620,6 +1256,11 @@ def select_region():
         overlay.destroy()
         root.deiconify()
         update_tracked_window_from_region()
+
+        # Show border if in "below" mode and realtime is running
+        if current_translation_mode == "below" and realtime_running:
+            if not show_region_border:
+                root.after(100, toggle_region_border)
 
     canvas.bind("<ButtonPress-1>", on_down)
     canvas.bind("<B1-Motion>", on_move)
@@ -855,7 +1496,7 @@ client = OpenAI(api_key=load_api_key())
 
 root = tk.Tk()
 root.title("On-Screen Translator (Realtime Overlay)")
-root.geometry("1040x600")
+root.geometry("1040x650")
 
 bar = tk.Frame(root)
 bar.pack(pady=8)
@@ -871,9 +1512,45 @@ input_lang_combo.pack(side="left", padx=6)
 target_lang_combo = ttk.Combobox(bar, values=list(TARGET_LANG_MAP.keys()), state="readonly", width=12)
 target_lang_combo.set("Tiếng Việt")
 target_lang_combo.pack(side="left", padx=6)
+target_lang_combo.bind("<<ComboboxSelected>>", on_target_lang_change)
 
-realtime_btn = tk.Button(bar, text="🔴 Realtime", bg="#7a1f1f", fg="white", command=toggle_realtime)
+realtime_btn = tk.Button(bar, text="🔴 Click Mode", bg="#7a1f1f", fg="white", command=toggle_realtime)
 realtime_btn.pack(side="left", padx=8)
+
+# Translation mode selector
+translation_mode_combo = ttk.Combobox(bar, values=list(TRANSLATION_MODES.keys()), state="readonly", width=16)
+translation_mode_combo.set("Auto Below Region")
+translation_mode_combo.pack(side="left", padx=6)
+
+def on_translation_mode_change(event=None):
+    global current_translation_mode
+    selected = translation_mode_combo.get()
+    current_translation_mode = TRANSLATION_MODES.get(selected, "click")
+    print(f"🔄 Translation mode changed to: {current_translation_mode}")
+
+    # Update button text immediately
+    update_realtime_button()
+
+    # If switching to "below" mode and realtime is on, show border
+    if current_translation_mode == "below" and realtime_running:
+        if not show_region_border:
+            toggle_region_border()
+
+translation_mode_combo.bind("<<ComboboxSelected>>", on_translation_mode_change)
+
+# Border toggle button
+border_toggle_btn = tk.Button(bar, text="⚫ Border", bg="#7a7a7a", fg="white", command=toggle_region_border, width=10)
+border_toggle_btn.pack(side="left", padx=6)
+
+# Debug frame
+debug_frame = tk.LabelFrame(root, text="🔍 Debug Info", padx=10, pady=5)
+debug_frame.pack(fill="x", padx=12, pady=(0, 5))
+
+debug_label = tk.Label(debug_frame, text="Ready...", anchor="w", fg="#555")
+debug_label.pack(side="left", fill="x", expand=True)
+
+debug_image_label = tk.Label(debug_frame, text="No image", bg="#f0f0f0", width=25, height=5)
+debug_image_label.pack(side="right", padx=(10, 0))
 
 output = tk.Text(root, wrap="word")
 output.pack(expand=True, fill="both", padx=12, pady=10)
